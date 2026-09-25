@@ -24,26 +24,20 @@ const CLOB_URL = "https://clob.polymarket.com";
 const RTDS_URL = "wss://ws-live-data.polymarket.com";
 const GAMMA_URL = "https://gamma-api.polymarket.com";
 
-const CSV_FILE = "btc_5m_telemetry.csv";
+const CSV_FILE = "btc_5m_2000_telemetry.csv";
 const INTERVAL_MS = 15000;
 
 // -----------------------------------------------------------------------------
 // Полимаркет RTDS: Chainlink BTC/USD + 30s/60s TWAP.
-// RTDS — публичный websocket, отдельные credentials не нужны.
 // -----------------------------------------------------------------------------
 
 const rtdsState = {
     spot: null,
     spotTimestamp: null,
-
     twap30: null,
     twap30Timestamp: null,
-
     twap60: null,
     twap60Timestamp: null,
-
-    // Небольшой буфер последних TWAP наблюдений.
-    // Нужен, чтобы не потерять стартовое значение, если Gamma ответил чуть позже.
     twapHistory: []
 };
 
@@ -51,6 +45,12 @@ let rtdsWs = null;
 let rtdsPingTimer = null;
 let rtdsReconnectTimer = null;
 let rtdsReconnectAttempt = 0;
+
+let globalMarketState = {
+    slug: null,
+    previousDirection: null,
+    crossingCount: 0
+};
 
 // -----------------------------------------------------------------------------
 // CSV
@@ -65,10 +65,8 @@ function initCsv() {
             "market_start",
             "market_end",
             "seconds_remaining",
-
             "btc_chainlink_spot",
             "btc_chainlink_timestamp",
-
             "price_to_beat",
             "price_to_beat_window_seconds",
             "price_to_beat_timestamp",
@@ -76,16 +74,13 @@ function initCsv() {
             "direction",
             "crossed_target",
             "crossing_count",
-
             "twap30",
             "twap30_timestamp",
             "twap60",
             "twap60_timestamp",
-
             "up_ask",
             "up_bid",
             "up_mid",
-
             "down_ask",
             "down_bid",
             "down_mid"
@@ -100,9 +95,34 @@ function initCsv() {
 // Helpers
 // -----------------------------------------------------------------------------
 
+// Автоматически возвращает плавающую точку для "сырых" блокчейн-данных (10^18 или 10^8)
+function normalizeOraclePrice(rawVal) {
+    if (rawVal === null || rawVal === undefined) return null;
+    const strVal = String(rawVal).trim().replace(/"/g, '');
+    let num = Number(strVal);
+    
+    if (Number.isNaN(num)) return null;
+    
+    // Если число уже нормализовано (например, 86000 < 10 миллионов)
+    if (num < 1e8) return num;
+    
+    // Считаем количество цифр до запятой, чтобы понять масштаб
+    const intPartLength = strVal.split('.')[0].length;
+    
+    // Если в числе 20+ цифр, это формат wei (18 нулей)
+    if (intPartLength >= 20) {
+        return num / 1e18;
+    } 
+    // Если от 10 до 15 цифр, это прямой Chainlink формат (8 нулей)
+    else if (intPartLength >= 10 && intPartLength <= 15) {
+        return num / 1e8;
+    }
+    
+    return num;
+}
+
 function parseJsonArray(value) {
     if (Array.isArray(value)) return value;
-
     if (typeof value === "string") {
         try {
             const parsed = JSON.parse(value);
@@ -111,13 +131,11 @@ function parseJsonArray(value) {
             return null;
         }
     }
-
     return null;
 }
 
 function parseJsonObject(value) {
     if (value && typeof value === "object") return value;
-
     if (typeof value === "string") {
         try {
             const parsed = JSON.parse(value);
@@ -126,7 +144,6 @@ function parseJsonObject(value) {
             return null;
         }
     }
-
     return null;
 }
 
@@ -138,23 +155,15 @@ function toFiniteNumber(value) {
 function csvValue(value) {
     if (value === null || value === undefined) return "";
     const text = String(value);
-
-    if (
-        text.includes(",") ||
-        text.includes('"') ||
-        text.includes("\n") ||
-        text.includes("\r")
-    ) {
+    if (text.includes(",") || text.includes('"') || text.includes("\n") || text.includes("\r")) {
         return `"${text.replace(/"/g, '""')}"`;
     }
-
     return text;
 }
 
 function getMarketTimestampFromSlug(slug) {
     const match = String(slug || "").match(/btc-updown-5m-(\d{10})$/i);
     if (!match) return null;
-
     const timestamp = Number(match[1]);
     return Number.isFinite(timestamp) ? timestamp : null;
 }
@@ -166,46 +175,26 @@ function getTwapLookbackSeconds(market) {
         market?.raw?.cryptoMarketConfig?.twapLookbackSeconds,
         parseJsonObject(market?.raw)?.cryptoMarketConfig?.twapLookbackSeconds
     ];
-
     for (const candidate of candidates) {
         const n = Number(candidate);
-        if (n === 30 || n === 60) {
-            return n;
-        }
+        if (n === 30 || n === 60) return n;
     }
-
     return 'UNKNOWN';
 }
 
 function extractUpDownTokenIds(market) {
     const tokenIds = parseJsonArray(market?.clobTokenIds);
-
-    if (!tokenIds || tokenIds.length < 2) {
-        return null;
-    }
-
+    if (!tokenIds || tokenIds.length < 2) return null;
     const outcomes = parseJsonArray(market?.outcomes);
-
     if (outcomes && outcomes.length === tokenIds.length) {
-        const normalized = outcomes.map(outcome =>
-            String(outcome).trim().toLowerCase()
-        );
-
+        const normalized = outcomes.map(outcome => String(outcome).trim().toLowerCase());
         const upIndex = normalized.findIndex(x => x === "up");
         const downIndex = normalized.findIndex(x => x === "down");
-
         if (upIndex >= 0 && downIndex >= 0) {
-            return {
-                tokenIdUp: tokenIds[upIndex],
-                tokenIdDown: tokenIds[downIndex]
-            };
+            return { tokenIdUp: tokenIds[upIndex], tokenIdDown: tokenIds[downIndex] };
         }
     }
-
-    return {
-        tokenIdUp: tokenIds[0],
-        tokenIdDown: tokenIds[1]
-    };
+    return { tokenIdUp: tokenIds[0], tokenIdDown: tokenIds[1] };
 }
 
 function getBestBid(book) {
@@ -219,91 +208,57 @@ function getBestAsk(book) {
 function calcMid(bid, ask) {
     const b = toFiniteNumber(bid);
     const a = toFiniteNumber(ask);
-
     if (b === null || a === null) return null;
     return ((b + a) / 2).toFixed(4);
 }
 
 // -----------------------------------------------------------------------------
-// RTDS
+// RTDS (WebSockets)
 // -----------------------------------------------------------------------------
 
 function rememberTwap(windowSeconds, value, timestampMs) {
     if (!Number.isFinite(timestampMs) || value === null) return;
-
-    const item = {
-        windowSeconds,
-        value: String(value),
-        timestampMs
-    };
-
+    const item = { windowSeconds, value: String(value), timestampMs };
     rtdsState.twapHistory.push(item);
-
-    const cutoff = Date.now() - 90_000;
-
-    while (
-        rtdsState.twapHistory.length > 0 &&
-        rtdsState.twapHistory[0].timestampMs < cutoff
-    ) {
+    const cutoff = Date.now() - 400_000;
+    while (rtdsState.twapHistory.length > 0 && rtdsState.twapHistory[0].timestampMs < cutoff) {
         rtdsState.twapHistory.shift();
     }
 }
 
 function handleRtdsMessage(rawMessage) {
     let message;
-
-    try {
-        message = JSON.parse(String(rawMessage));
-    } catch {
-        return;
-    }
+    try { message = JSON.parse(String(rawMessage)); } catch { return; }
 
     if (message?.topic === "crypto_prices_chainlink") {
         const payload = message.payload;
-
         if (!payload) return;
-
         const symbol = String(payload.symbol || "").toLowerCase();
-
         if (symbol !== "btc/usd") return;
-
-        const value = payload.value;
+        
+        const value = normalizeOraclePrice(payload.value);
         const timestampMs = Number(payload.timestamp);
-
-        if (value === undefined || !Number.isFinite(timestampMs)) {
-            return;
-        }
-
+        
+        if (value === null || !Number.isFinite(timestampMs)) return;
         rtdsState.spot = String(value);
         rtdsState.spotTimestamp = timestampMs;
-
         return;
     }
 
-    const twapTopicToWindow = {
-        crypto_prices_twap_thirty: 30,
-        crypto_prices_twap_sixty: 60
-    };
-
+    const twapTopicToWindow = { crypto_prices_twap_thirty: 30, crypto_prices_twap_sixty: 60 };
     const windowSeconds = twapTopicToWindow[message?.topic];
-
-    if (!windowSeconds) return;
-    if (message?.type !== "update") return;
-
+    if (!windowSeconds || message?.type !== "update") return;
+    
     const payload = message.payload;
-
     if (!payload) return;
-
     const symbol = String(payload.symbol || "").toLowerCase();
-
     if (symbol !== "btc/usd") return;
-
-    const value = payload.full_accuracy_value ?? payload.value;
+    
+    const rawValue = payload.full_accuracy_value ?? payload.value;
+    const value = normalizeOraclePrice(rawValue);
     const timestampMs = Number(payload.timestamp);
-
-    if (value === undefined || !Number.isFinite(timestampMs)) {
-        return;
-    }
+    
+    if (value === null || !Number.isFinite(timestampMs)) return;
 
     rememberTwap(windowSeconds, value, timestampMs);
 
@@ -317,16 +272,8 @@ function handleRtdsMessage(rawMessage) {
 }
 
 function connectRtds() {
-    if (rtdsReconnectTimer) {
-        clearTimeout(rtdsReconnectTimer);
-        rtdsReconnectTimer = null;
-    }
-
-    if (rtdsPingTimer) {
-        clearInterval(rtdsPingTimer);
-        rtdsPingTimer = null;
-    }
-
+    if (rtdsReconnectTimer) { clearTimeout(rtdsReconnectTimer); rtdsReconnectTimer = null; }
+    if (rtdsPingTimer) { clearInterval(rtdsPingTimer); rtdsPingTimer = null; }
     try {
         rtdsWs = new WebSocket(RTDS_URL);
     } catch (error) {
@@ -336,74 +283,32 @@ function connectRtds() {
 
     rtdsWs.on("open", () => {
         rtdsReconnectAttempt = 0;
-
         const subscribeFrame = {
             action: "subscribe",
             subscriptions: [
-                {
-                    topic: "crypto_prices_chainlink",
-                    type: "*",
-                    filters: JSON.stringify({ symbol: "btc/usd" })
-                },
-                {
-                    topic: "crypto_prices_twap_thirty",
-                    type: "update",
-                    filters: JSON.stringify({ symbol: "btc/usd" })
-                },
-                {
-                    topic: "crypto_prices_twap_sixty",
-                    type: "update",
-                    filters: JSON.stringify({ symbol: "btc/usd" })
-                }
+                { topic: "crypto_prices_chainlink", type: "*", filters: JSON.stringify({ symbol: "btc/usd" }) },
+                { topic: "crypto_prices_twap_thirty", type: "update", filters: JSON.stringify({ symbol: "btc/usd" }) },
+                { topic: "crypto_prices_twap_sixty", type: "update", filters: JSON.stringify({ symbol: "btc/usd" }) }
             ]
         };
-
         rtdsWs.send(JSON.stringify(subscribeFrame));
-
-        rtdsPingTimer = setInterval(() => {
-            if (rtdsWs?.readyState === WebSocket.OPEN) {
-                rtdsWs.send("PING");
-            }
-        }, 5000);
-
+        rtdsPingTimer = setInterval(() => { if (rtdsWs?.readyState === WebSocket.OPEN) rtdsWs.send("PING"); }, 5000);
         console.log("RTDS подключён: Chainlink BTC/USD + TWAP 30s/60s");
     });
-
     rtdsWs.on("message", handleRtdsMessage);
-
-    rtdsWs.on("error", error => {
-        console.error("RTDS error:", error.message);
-    });
-
+    rtdsWs.on("error", error => console.error("RTDS error:", error.message));
     rtdsWs.on("close", () => {
-        if (rtdsPingTimer) {
-            clearInterval(rtdsPingTimer);
-            rtdsPingTimer = null;
-        }
-
+        if (rtdsPingTimer) { clearInterval(rtdsPingTimer); rtdsPingTimer = null; }
         scheduleRtdsReconnect();
     });
 }
 
 function scheduleRtdsReconnect(error) {
     if (rtdsReconnectTimer) return;
-
     rtdsReconnectAttempt += 1;
-
-    const delay = Math.min(
-        30_000,
-        1000 * 2 ** Math.min(rtdsReconnectAttempt - 1, 5)
-    );
-
-    console.error(
-        `RTDS отключён${error ? `: ${error.message}` : ""}. ` +
-        `Повторное подключение через ${delay} ms`
-    );
-
-    rtdsReconnectTimer = setTimeout(() => {
-        rtdsReconnectTimer = null;
-        connectRtds();
-    }, delay);
+    const delay = Math.min(30_000, 1000 * 2 ** Math.min(rtdsReconnectAttempt - 1, 5));
+    console.error(`RTDS отключён${error ? `: ${error.message}` : ""}. Повторное подключение через ${delay} ms`);
+    rtdsReconnectTimer = setTimeout(() => { rtdsReconnectTimer = null; connectRtds(); }, delay);
 }
 
 // -----------------------------------------------------------------------------
@@ -412,50 +317,26 @@ function scheduleRtdsReconnect(error) {
 
 async function getActiveBtc5mMarket() {
     const nowSec = Math.floor(Date.now() / 1000);
-
-    // slug содержит START текущего окна
     const marketStartSec = Math.floor(nowSec / 300) * 300;
     const slug = `btc-updown-5m-${marketStartSec}`;
 
     try {
-        const eventResponse = await fetch(
-            `${GAMMA_URL}/events?slug=${encodeURIComponent(slug)}`
-        );
-
+        const eventResponse = await fetch(`${GAMMA_URL}/events?slug=${encodeURIComponent(slug)}`);
         if (eventResponse.ok) {
             const events = await eventResponse.json();
-
             if (Array.isArray(events) && events.length > 0) {
                 const market = events[0]?.markets?.find(m => !m.closed);
-
-                if (market) {
-                    return {
-                        market,
-                        slug
-                    };
-                }
+                if (market) return { market, slug };
             }
         }
-
-        const marketResponse = await fetch(
-            `${GAMMA_URL}/markets?slug=${encodeURIComponent(slug)}`
-        );
-
+        const marketResponse = await fetch(`${GAMMA_URL}/markets?slug=${encodeURIComponent(slug)}`);
         if (marketResponse.ok) {
             const markets = await marketResponse.json();
-
             if (Array.isArray(markets)) {
                 const market = markets.find(m => !m.closed);
-
-                if (market) {
-                    return {
-                        market,
-                        slug
-                    };
-                }
+                if (market) return { market, slug };
             }
         }
-
         return null;
     } catch (error) {
         console.error("Ошибка получения рынка:", error.message);
@@ -470,10 +351,7 @@ async function getActiveBtc5mMarket() {
 function getPriceToBeatForMarket(market) {
     const slug = market?.slug || "";
     const startSec = getMarketTimestampFromSlug(slug);
-
-    if (startSec === null) {
-        return null;
-    }
+    if (startSec === null) return null;
 
     const startMs = startSec * 1000;
     const windowSeconds = getTwapLookbackSeconds(market);
@@ -485,26 +363,15 @@ function getPriceToBeatForMarket(market) {
             item.timestampMs < startMs + 15_000
     );
 
-    if (!candidate) {
-        return null;
-    }
-
-    return {
-        value: candidate.value,
-        windowSeconds,
-        timestampMs: candidate.timestampMs
-    };
+    if (!candidate) return null;
+    return { value: candidate.value, windowSeconds, timestampMs: candidate.timestampMs };
 }
 
-async function getPriceToBeat(market, marketStartMs, marketEndMs) {
+async function getPriceToBeatAPI(market, marketStartMs, marketEndMs) {
     try {
         const eventStartTime = new Date(marketStartMs).toISOString();
         const endDate = new Date(marketEndMs).toISOString();
-
-        const url = new URL(
-            "https://polymarket.com/api/crypto/crypto-price"
-        );
-
+        const url = new URL("https://polymarket.com/api/crypto/crypto-price");
         url.searchParams.set("symbol", "BTC");
         url.searchParams.set("eventStartTime", eventStartTime);
         url.searchParams.set("variant", "fiveminute");
@@ -512,49 +379,20 @@ async function getPriceToBeat(market, marketStartMs, marketEndMs) {
 
         const response = await fetch(url, {
             headers: {
-                "User-Agent":
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-                    "AppleWebKit/537.36 (KHTML, like Gecko) " +
-                    "Chrome/153.0.0.0 Safari/537.36",
-
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
                 "Accept": "application/json",
                 "Referer": "https://polymarket.com/"
             }
         });
 
-        if (!response.ok) {
-            const body = await response.text();
-
-            console.error(
-                `PriceToBeat HTTP ${response.status}: ${body.slice(0, 300)}`
-            );
-
-            return null;
-        }
-
+        if (!response.ok) return null;
         const data = await response.json();
-
         const openPrice = Number(data?.openPrice);
 
-        if (!Number.isFinite(openPrice) || openPrice <= 0) {
-            console.error(
-                "PriceToBeat: openPrice отсутствует:",
-                data
-            );
-
-            return null;
-        }
-
-        return {
-            price: openPrice,
-            raw: data
-        };
+        if (!Number.isFinite(openPrice) || openPrice <= 0) return null;
+        
+        return { price: openPrice, raw: data };
     } catch (error) {
-        console.error(
-            "Ошибка получения Price to Beat:",
-            error.message
-        );
-
         return null;
     }
 }
@@ -566,48 +404,36 @@ async function getPriceToBeat(market, marketStartMs, marketEndMs) {
 async function collectData(clobClient) {
     try {
         const result = await getActiveBtc5mMarket();
-
         if (!result) {
-            console.log(
-                `[${new Date().toLocaleTimeString()}] ` +
-                `⚠️ Текущий BTC 5m market ещё не найден`
-            );
-
+            console.log(`[${new Date().toLocaleTimeString()}] ⚠️ Текущий BTC 5m market ещё не найден`);
             return;
         }
 
         const { market, slug } = result;
-
         const marketStartSec = getMarketTimestampFromSlug(slug);
-
-        if (marketStartSec === null) {
-            console.log(`⚠️ Некорректный slug рынка: ${slug}`);
-            return;
-        }
+        if (marketStartSec === null) return;
 
         const marketStartMs = marketStartSec * 1000;
         const marketEndMs = marketStartMs + 300_000;
 
-        const priceToBeatResult = await getPriceToBeat(
-            market,
-            marketStartMs,
-            marketEndMs
-        );
+        let priceToBeat = getPriceToBeatForMarket(market);
 
-        const priceToBeat = priceToBeatResult?.price ?? null;
+        if (!priceToBeat) {
+            const ptbApiResult = await getPriceToBeatAPI(market, marketStartMs, marketEndMs);
+            if (ptbApiResult && ptbApiResult.price) {
+                priceToBeat = {
+                    value: ptbApiResult.price,
+                    windowSeconds: getTwapLookbackSeconds(market),
+                    timestampMs: marketStartMs
+                };
+            }
+        }
 
-        const secondsRemaining = Math.max(
-            0,
-            Math.floor((marketEndMs - Date.now()) / 1000)
-        );
-
+        const secondsRemaining = Math.max(0, Math.floor((marketEndMs - Date.now()) / 1000));
         const tokens = extractUpDownTokenIds(market);
 
         if (!tokens) {
-            console.log(
-                `⚠️ Не удалось получить UP/DOWN token IDs: ${slug}`
-            );
-
+            console.log(`⚠️ Не удалось получить UP/DOWN token IDs: ${slug}`);
             return;
         }
 
@@ -620,12 +446,10 @@ async function collectData(clobClient) {
 
         const upAsk = getBestAsk(orderbookUp);
         const upBid = getBestBid(orderbookUp);
-
         const downAsk = getBestAsk(orderbookDown);
         const downBid = getBestBid(orderbookDown);
 
         const btcSpot = rtdsState.spot;
-
         const btcSpotNumber = toFiniteNumber(btcSpot);
         const ptbNumber = toFiniteNumber(priceToBeat?.value);
 
@@ -633,28 +457,14 @@ async function collectData(clobClient) {
         let direction = "UNKNOWN";
 
         if (btcSpotNumber !== null && ptbNumber !== null) {
-            distanceToTarget = (
-                btcSpotNumber - ptbNumber
-            ).toFixed(2);
-
-            if (btcSpotNumber > ptbNumber) {
-                direction = "UP";
-            } else if (btcSpotNumber < ptbNumber) {
-                direction = "DOWN";
-            } else {
-                direction = "AT_TARGET";
-            }
+            distanceToTarget = (btcSpotNumber - ptbNumber).toFixed(2);
+            if (btcSpotNumber > ptbNumber) direction = "UP";
+            else if (btcSpotNumber < ptbNumber) direction = "DOWN";
+            else direction = "AT_TARGET";
         }
 
-        let marketState = {
-            slug: null,
-            previousDirection: null,
-            crossingCount: 0
-        };
-
-        
-        if (marketState.slug !== slug) {
-            marketState = {
+        if (globalMarketState.slug !== slug) {
+            globalMarketState = {
                 slug,
                 previousDirection: null,
                 crossingCount: 0
@@ -663,16 +473,13 @@ async function collectData(clobClient) {
 
         if (
             direction !== "UNKNOWN" &&
-            marketState.previousDirection !== null &&
-            direction !== marketState.previousDirection
+            globalMarketState.previousDirection !== null &&
+            direction !== globalMarketState.previousDirection
         ) {
-            marketState.crossingCount += 1;
+            globalMarketState.crossingCount += 1;
         }
 
-        marketState.previousDirection = direction;
-
-
-
+        globalMarketState.previousDirection = direction;
 
         const timestamp = new Date().toISOString();
         const marketTitle = market.question || "BTC Up or Down 5m";
@@ -684,43 +491,22 @@ async function collectData(clobClient) {
             new Date(marketStartMs).toISOString(),
             new Date(marketEndMs).toISOString(),
             secondsRemaining,
-
             btcSpot ?? "",
-            rtdsState.spotTimestamp
-                ? new Date(
-                    rtdsState.spotTimestamp
-                ).toISOString()
-                : "",
-
+            rtdsState.spotTimestamp ? new Date(rtdsState.spotTimestamp).toISOString() : "",
             priceToBeat?.value ?? "",
             priceToBeat?.windowSeconds ?? "",
-            priceToBeat?.timestampMs
-                ? new Date(
-                    priceToBeat.timestampMs
-                ).toISOString()
-                : "",
-
+            priceToBeat?.timestampMs ? new Date(priceToBeat.timestampMs).toISOString() : "",
             distanceToTarget ?? "",
             direction,
-
+            globalMarketState.crossingCount > 0 ? "YES" : "NO",
+            globalMarketState.crossingCount,
             rtdsState.twap30 ?? "",
-            rtdsState.twap30Timestamp
-                ? new Date(
-                    rtdsState.twap30Timestamp
-                ).toISOString()
-                : "",
-
+            rtdsState.twap30Timestamp ? new Date(rtdsState.twap30Timestamp).toISOString() : "",
             rtdsState.twap60 ?? "",
-            rtdsState.twap60Timestamp
-                ? new Date(
-                    rtdsState.twap60Timestamp
-                ).toISOString()
-                : "",
-
+            rtdsState.twap60Timestamp ? new Date(rtdsState.twap60Timestamp).toISOString() : "",
             upAsk ?? "",
             upBid ?? "",
             calcMid(upBid, upAsk) ?? "",
-
             downAsk ?? "",
             downBid ?? "",
             calcMid(downBid, downAsk) ?? ""
@@ -729,21 +515,14 @@ async function collectData(clobClient) {
         fs.appendFileSync(CSV_FILE, row, "utf8");
 
         console.log(
-            `[${new Date().toLocaleTimeString()}] ` +
-            `${slug} | ` +
-            `осталось ${secondsRemaining}s | ` +
-            `BTC Chainlink $${btcSpot ?? "N/A"} | ` +
-            `PTB $${priceToBeat?.value ?? "N/A"} | ` +
-            `${direction} | ` +
-            `Δ ${distanceToTarget ?? "N/A"} | ` +
-            `UP A/B ${upAsk ?? "N/A"}/${upBid ?? "N/A"} | ` +
-            `DOWN A/B ${downAsk ?? "N/A"}/${downBid ?? "N/A"}`
+            `[${new Date().toLocaleTimeString()}] ${slug} | ` +
+            `осталось ${secondsRemaining}s | BTC $${btcSpot ?? "N/A"} | ` +
+            `PTB $${ptbNumber ?? "N/A"} | ${direction} | ` +
+            `Δ ${distanceToTarget ?? "N/A"} | UP A/B ${upAsk ?? "N/A"}/${upBid ?? "N/A"} | ` +
+            `DOWN A/B ${downAsk ?? "N/A"}/${downBid ?? "N/A"} | Пересечений: ${globalMarketState.crossingCount}`
         );
     } catch (error) {
-        console.error(
-            "Ошибка при выполнении сбора:",
-            error.message
-        );
+        console.error("Ошибка при выполнении сбора:", error.message);
     }
 }
 
@@ -757,50 +536,24 @@ async function start() {
     console.log("Запуск Polymarket BTC 5m collector...");
     console.log(`Интервал записи: ${INTERVAL_MS / 1000} секунд`);
 
-    // RTDS должен быть подключён ДО начала текущего market window,
-    // чтобы поймать Price to Beat.
     connectRtds();
 
-    const authClient = new ClobClient(
-        CLOB_URL,
-        137,
-        walletClient
-    );
-
+    const authClient = new ClobClient(CLOB_URL, 137, walletClient);
     const creds = await authClient.createOrDeriveApiKey();
-
-    const clobClient = new ClobClient(
-        CLOB_URL,
-        137,
-        walletClient,
-        creds
-    );
+    const clobClient = new ClobClient(CLOB_URL, 137, walletClient, creds);
 
     console.log("CLOB client готов.");
     console.log("Для остановки нажмите Ctrl + C\n");
 
     await collectData(clobClient);
-
-    setInterval(() => {
-        collectData(clobClient);
-    }, INTERVAL_MS);
+    setInterval(() => collectData(clobClient), INTERVAL_MS);
 }
 
 process.on("SIGINT", () => {
     console.log("\nОстанавливаем collector...");
-
-    if (rtdsPingTimer) {
-        clearInterval(rtdsPingTimer);
-    }
-
-    if (rtdsReconnectTimer) {
-        clearTimeout(rtdsReconnectTimer);
-    }
-
-    if (rtdsWs) {
-        rtdsWs.close();
-    }
-
+    if (rtdsPingTimer) clearInterval(rtdsPingTimer);
+    if (rtdsReconnectTimer) clearTimeout(rtdsReconnectTimer);
+    if (rtdsWs) rtdsWs.close();
     process.exit(0);
 });
 
